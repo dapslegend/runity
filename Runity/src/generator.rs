@@ -15,6 +15,7 @@ pub struct KeyPair {
 pub struct VanityGenerator {
     prefix: Option<String>,
     suffix: Option<String>,
+    #[allow(dead_code)]
     address_pattern: Regex,
 }
 
