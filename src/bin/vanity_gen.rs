@@ -29,7 +29,7 @@ fn main() -> anyhow::Result<()> {
             hex::encode(kp.secret)
         );
     } else {
-        println!("{{\"address\":\"{}"}}", address);
+        println!("{{\"address\":\"{}\"}}", address);
     }
     Ok(())
 }
